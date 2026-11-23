@@ -1,0 +1,114 @@
+"""Protótipo simulado (mock) do sistema Raízes do Nordeste - usado apenas para executar os testes de QA."""
+import threading
+
+class Unauthorized(Exception): pass      # HTTP 401
+class Forbidden(Exception): pass         # HTTP 403
+class OutOfStock(Exception): pass
+class InvalidTransition(Exception): pass
+class GatewayTimeout(Exception): pass
+
+TRANSICOES = {
+    "CRIADO": {"AGUARDANDO_PAGAMENTO", "CANCELADO"},
+    "AGUARDANDO_PAGAMENTO": {"PAGO", "CANCELADO"},
+    "PAGO": {"EM_PREPARO", "CANCELADO"},
+    "EM_PREPARO": {"PRONTO"},
+    "PRONTO": {"ENTREGUE"},
+    "ENTREGUE": set(), "CANCELADO": set(),
+}
+
+class GatewayFake:
+    """Simula o serviço externo de pagamento (sandbox)."""
+    def __init__(self, resultado="APROVADO"): self.resultado = resultado
+    def charge(self, order_id, valor):
+        if self.resultado == "TIMEOUT": raise GatewayTimeout()
+        return self.resultado
+
+class Sistema:
+    def __init__(self, gateway):
+        self.gw = gateway
+        self.lock = threading.Lock()
+        self.tokens = {}      
+        self.precos = {"tapioca": 8.0, "cuscuz": 10.0, "bolo_macaxeira": 6.0, "canjica": 7.0}
+        self.sazonais = {"canjica"}          
+        self.mes_atual = 6
+        self.estoque = {}     
+        self.pedidos = {}; self.proximo = 1
+        self.pontos = {}; self.consentimento = {}
+        self.auditoria = []; self.eventos_processados = set()
+
+    def registrar_usuario(self, token, usuario, papel, unidade=None): self.tokens[token] = (usuario, papel, unidade)
+    def _auth(self, token, papeis=None):
+        if token not in self.tokens: raise Unauthorized()
+        u = self.tokens[token]
+        if papeis and u[1] not in papeis: raise Forbidden()
+        return u
+    def _audit(self, usuario, acao, **dados): self.auditoria.append({"usuario": usuario, "acao": acao, **dados})
+
+    def cardapio(self, unidade):
+        itens = []
+        for item, qtd in self.estoque.get(unidade, {}).items():
+            if qtd <= 0: continue
+            if item in self.sazonais and self.mes_atual not in (6, 7): continue
+            itens.append(item)
+        return sorted(itens)
+
+    def criar_pedido(self, token, unidade, itens, canal="app"):
+        self._auth(token)
+        with self.lock:
+            est = self.estoque.get(unidade, {})
+            for item, q in itens.items():
+                if est.get(item, 0) < q: raise OutOfStock(item)
+            for item, q in itens.items(): est[item] -= q
+            pid = self.proximo; self.proximo += 1
+            total = sum(self.precos[i] * q for i, q in itens.items())
+            self.pedidos[pid] = {"unidade": unidade, "itens": dict(itens), "total": total, "canal": canal,
+                                 "status": "AGUARDANDO_PAGAMENTO", "cliente": self.tokens[token][0], "pontos": 0}
+            return pid
+
+    def _mudar(self, pid, novo):
+        p = self.pedidos[pid]
+        if novo not in TRANSICOES[p["status"]]: raise InvalidTransition(f'{p["status"]}->{novo}')
+        p["status"] = novo
+
+    def _confirmar(self, pid):
+        p = self.pedidos[pid]; self._mudar(pid, "PAGO")
+        if self.consentimento.get(p["cliente"]):
+            p["pontos"] = int(p["total"]); self.pontos[p["cliente"]] = self.pontos.get(p["cliente"], 0) + p["pontos"]
+
+    def _liberar_estoque(self, pid):
+        p = self.pedidos[pid]
+        for i, q in p["itens"].items(): self.estoque[p["unidade"]][i] += q
+
+    def pagar(self, pid):
+        p = self.pedidos[pid]
+        try: res = self.gw.charge(pid, p["total"])
+        except GatewayTimeout: return "AGUARDANDO_PAGAMENTO"  
+        if res == "APROVADO": self._confirmar(pid)
+        else: self._mudar(pid, "CANCELADO"); self._liberar_estoque(pid)
+        return p["status"]
+
+    def webhook(self, pid, evento_id, resultado):
+        """Confirmação assíncrona; idempotente pelo id do evento."""
+        if evento_id in self.eventos_processados: return self.pedidos[pid]["status"]
+        self.eventos_processados.add(evento_id)
+        if resultado == "APROVADO": self._confirmar(pid)
+        return self.pedidos[pid]["status"]
+
+    def avancar(self, pid, novo): self._mudar(pid, novo)
+
+    def cancelar(self, token, pid, motivo):
+        usuario, _, _ = self._auth(token, {"gerente"})
+        p = self.pedidos[pid]; self._mudar(pid, "CANCELADO"); self._liberar_estoque(pid)
+        if p["pontos"]: self.pontos[p["cliente"]] -= p["pontos"]; p["pontos"] = 0
+        self._audit(usuario, "CANCELAMENTO", pedido=pid, motivo=motivo, valor=p["total"], unidade=p["unidade"])
+
+    def definir_consentimento(self, cliente, aceito): self.consentimento[cliente] = aceito
+    def campanha_segmentada(self, clientes): return [c for c in clientes if self.consentimento.get(c)]
+
+    def relatorio_consolidado(self, token):
+        self._auth(token, {"matriz"})
+        por_unidade = {}
+        for p in self.pedidos.values():
+            if p["status"] in ("PAGO", "EM_PREPARO", "PRONTO", "ENTREGUE"):
+                por_unidade[p["unidade"]] = por_unidade.get(p["unidade"], 0) + p["total"]
+        return por_unidade 
