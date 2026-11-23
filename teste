@@ -1,0 +1,92 @@
+import unittest, threading
+from raizes import *
+
+def novo(resultado="APROVADO"):
+    s = Sistema(GatewayFake(resultado))
+    s.estoque = {"REC01": {"tapioca": 10, "cuscuz": 5, "bolo_macaxeira": 0, "canjica": 5},
+                 "SSA01": {"tapioca": 3, "cuscuz": 0}}
+    s.registrar_usuario("tk_cli", "ana", "cliente"); s.registrar_usuario("tk_cli2", "bia", "cliente")
+    s.registrar_usuario("tk_ate", "carlos", "atendente", "REC01"); s.registrar_usuario("tk_ger", "dora", "gerente", "REC01")
+    s.registrar_usuario("tk_mat", "edu", "matriz")
+    return s
+
+class TestPedidosCardapio(unittest.TestCase):
+    def test_CT01_cardapio_por_unidade_e_sazonal(self):
+        s = novo(); self.assertEqual(s.cardapio("SSA01"), ["tapioca"])
+        self.assertIn("canjica", s.cardapio("REC01"))
+        s.mes_atual = 3; self.assertNotIn("canjica", s.cardapio("REC01"))
+    def test_CT02_produto_indisponivel_bloqueado(self):
+        s = novo()
+        with self.assertRaises(OutOfStock): s.criar_pedido("tk_cli", "REC01", {"bolo_macaxeira": 1})
+    def test_CT03_mesmo_pedido_em_todos_os_canais(self):
+        s = novo(); ids = [s.criar_pedido("tk_cli", "REC01", {"tapioca": 2}, canal=c) for c in ("app", "totem", "balcao")]
+        self.assertEqual({s.pedidos[i]["total"] for i in ids}, {16.0})
+        self.assertEqual({s.pedidos[i]["status"] for i in ids}, {"AGUARDANDO_PAGAMENTO"})
+    def test_CT04_estoque_concorrente_ultimo_item(self):
+        s = novo(); s.estoque["REC01"]["cuscuz"] = 1; ok, erro = [], []
+        def t(tk):
+            try: ok.append(s.criar_pedido(tk, "REC01", {"cuscuz": 1}))
+            except OutOfStock: erro.append(1)
+        th = [threading.Thread(target=t, args=(k,)) for k in ("tk_cli", "tk_cli2")]
+        [x.start() for x in th]; [x.join() for x in th]
+        self.assertEqual((len(ok), len(erro)), (1, 1)); self.assertEqual(s.estoque["REC01"]["cuscuz"], 0)
+    def test_CT05_status_em_ordem_valida_e_invalida(self):
+        s = novo(); pid = s.criar_pedido("tk_cli", "REC01", {"tapioca": 1}); s.pagar(pid)
+        for st in ("EM_PREPARO", "PRONTO", "ENTREGUE"): s.avancar(pid, st)
+        self.assertEqual(s.pedidos[pid]["status"], "ENTREGUE")
+        with self.assertRaises(InvalidTransition): s.avancar(pid, "PAGO")
+
+class TestPagamento(unittest.TestCase):
+    def test_CT06_pagamento_aprovado(self):
+        s = novo(); pid = s.criar_pedido("tk_cli", "REC01", {"tapioca": 2})
+        self.assertEqual(s.pagar(pid), "PAGO"); self.assertEqual(s.estoque["REC01"]["tapioca"], 8)
+    def test_CT07_pagamento_negado_preserva_estoque(self):
+        s = novo("NEGADO"); pid = s.criar_pedido("tk_cli", "REC01", {"tapioca": 2})
+        self.assertEqual(s.pagar(pid), "CANCELADO"); self.assertEqual(s.estoque["REC01"]["tapioca"], 10)
+    def test_CT08_timeout_mantem_aguardando(self):
+        s = novo("TIMEOUT"); pid = s.criar_pedido("tk_cli", "REC01", {"tapioca": 1})
+        self.assertEqual(s.pagar(pid), "AGUARDANDO_PAGAMENTO")
+    def test_CT09_confirmacao_duplicada_processada_uma_vez(self):
+        s = novo("TIMEOUT"); s.definir_consentimento("ana", True)
+        pid = s.criar_pedido("tk_cli", "REC01", {"tapioca": 5}); s.pagar(pid)
+        s.webhook(pid, "evt-1", "APROVADO"); s.webhook(pid, "evt-1", "APROVADO")
+        self.assertEqual(s.pedidos[pid]["status"], "PAGO"); self.assertEqual(s.pontos["ana"], 40)
+
+class TestFidelidadeLGPD(unittest.TestCase):
+    def test_CT10_acumulo_de_pontos_com_consentimento(self):
+        s = novo(); s.definir_consentimento("ana", True); s.precos["tapioca"] = 50.0
+        pid = s.criar_pedido("tk_cli", "REC01", {"tapioca": 1}); s.pagar(pid); self.assertEqual(s.pontos["ana"], 50)
+    def test_CT11_pontos_estornados_no_cancelamento(self):
+        s = novo(); s.definir_consentimento("ana", True)
+        pid = s.criar_pedido("tk_cli", "REC01", {"tapioca": 5}); s.pagar(pid); s.cancelar("tk_ger", pid, "erro")
+        self.assertEqual(s.pontos["ana"], 0); self.assertEqual(len(s.auditoria), 1)
+    def test_CT12_sem_consentimento_fora_da_campanha(self):
+        s = novo(); s.definir_consentimento("ana", False); s.definir_consentimento("bia", True)
+        self.assertEqual(s.campanha_segmentada(["ana", "bia"]), ["bia"])
+        pid = s.criar_pedido("tk_cli", "REC01", {"tapioca": 1}); self.assertEqual(s.pagar(pid), "PAGO")
+        self.assertNotIn("ana", s.pontos)
+    def test_CT13_revogacao_e_relatorio_anonimizado(self):
+        s = novo(); s.definir_consentimento("bia", True); s.definir_consentimento("bia", False)
+        self.assertEqual(s.campanha_segmentada(["bia"]), [])
+        pid = s.criar_pedido("tk_cli", "REC01", {"tapioca": 1}); s.pagar(pid)
+        rel = s.relatorio_consolidado("tk_mat"); self.assertEqual(rel, {"REC01": 8.0}); self.assertNotIn("ana", str(rel))
+
+class TestSegurancaAuditoria(unittest.TestCase):
+    def test_CT14_sem_login_retorna_401(self):
+        s = novo()
+        with self.assertRaises(Unauthorized): s.criar_pedido("token_invalido", "REC01", {"tapioca": 1})
+    def test_CT15_sem_permissao_retorna_403(self):
+        s = novo()
+        with self.assertRaises(Forbidden): s.relatorio_consolidado("tk_ate")
+    def test_CT16_auditoria_de_cancelamento(self):
+        s = novo(); pid = s.criar_pedido("tk_cli", "REC01", {"tapioca": 1}); s.cancelar("tk_ger", pid, "cliente desistiu")
+        a = s.auditoria[0]; self.assertEqual((a["usuario"], a["acao"], a["motivo"], a["unidade"]), ("dora", "CANCELAMENTO", "cliente desistiu", "REC01"))
+        with self.assertRaises(Forbidden): s.cancelar("tk_ate", pid, "x")
+
+class TestRelatorio(unittest.TestCase):
+    def test_CT19_totais_batem_com_pedidos_pagos(self):
+        s = novo(); a = s.criar_pedido("tk_cli", "REC01", {"tapioca": 2}); b = s.criar_pedido("tk_cli", "REC01", {"cuscuz": 1})
+        c = s.criar_pedido("tk_cli", "SSA01", {"tapioca": 1}); [s.pagar(x) for x in (a, b, c)]
+        self.assertEqual(s.relatorio_consolidado("tk_mat"), {"REC01": 26.0, "SSA01": 8.0})
+
+if __name__ == "__main__": unittest.main(verbosity=2)
